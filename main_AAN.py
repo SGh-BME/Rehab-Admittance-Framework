@@ -1,5 +1,5 @@
 ####### --------------------------------------------------------
-#AAN,m.,m,,m
+#AAN _ version 2
 ####### --------------------------------------------------------
 
 import pybullet as p
@@ -105,24 +105,6 @@ CONFIG = {
         "xy_extent_mm": 800.0,  # radius of grid labels, center to edge (for ticks)
         "refresh_hz": 120.0,
     },
-    # -------- Pushable Box Config --------
-    "box": {
-        # Half extents in meters; 0.125 => 25 cm cube (side length = 2*half)
-        "half_extents_m": 0.125,
-        # Mass in kg
-        "mass_kg": 2.0,
-        # Default start position (x, y, z) meters; z will be clamped to >= half so it sits on the plane
-        "start_pos_m": [0.45, 0.15, 0.125],
-        # Visual color RGBA
-        "color": [0.2, 0.6, 1.0, 1.0],
-        # Contact/dynamics (kept consistent after any change)
-        "lateral_friction": 0.8,
-        "rolling_friction": 0.001,
-        "spinning_friction": 0.001,
-        "restitution": 0.0,
-        "linear_damping": 0.02,
-        "angular_damping": 0.02
-    }
 }
 
 # =============================================================================
@@ -419,8 +401,8 @@ class SimulationController:
         self.ik_joint_ranges = []
         self.is_returning_home = False  # State flag for the return home sequence
 
-        # --- Add Box state ---
-        self.box_id = None  # pybullet bodyUniqueId for the pushable box
+        # --- Target marker: small sphere at EE z, visual only (no collision) ---
+        self.target_marker_id = None
 
         self._setup_bullet()
         self._load_robot()
@@ -436,6 +418,34 @@ class SimulationController:
             self.ee_target[2] = self.fixed_z
             self.ee_home[2] = self.fixed_z
             self.shared['tuning']['j1_z_height_m'] = self.fixed_z
+
+        self._create_target_marker()
+
+    def _create_target_marker(self):
+        """Create a small sphere above EE z for target visualization (visual only, no collision)."""
+        self.target_marker_radius = 0.015  # 1.5 cm sphere
+        self.target_marker_z_offset = 0.06  # place 8 cm above EE so it clears the geometry
+        vis_id = p.createVisualShape(p.GEOM_SPHERE, radius=self.target_marker_radius, rgbaColor=[1.0, 0.2, 0.2, 0.9])
+        self.target_marker_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=vis_id,
+            basePosition=[0, 0, -10],
+            baseOrientation=[0, 0, 0, 1],
+        )
+
+    def _update_target_marker(self):
+        """Move target marker to (target_x, target_y, fixed_z + offset) or hide if no target."""
+        if self.target_marker_id is None:
+            return
+        with self.lock:
+            tgt = self.shared.get("target_xy_m", None)
+        z = self.fixed_z + self.target_marker_z_offset
+        if tgt is not None:
+            x, y = float(tgt[0]), float(tgt[1])
+            p.resetBasePositionAndOrientation(self.target_marker_id, [x, y, z], [0, 0, 0, 1])
+        else:
+            p.resetBasePositionAndOrientation(self.target_marker_id, [0, 0, -10], [0, 0, 0, 1])
 
     def _setup_bullet(self):
         p.connect(p.GUI)
@@ -527,109 +537,6 @@ class SimulationController:
                 self.app.log(f"Saved log: {self.log_path}")
         #===========================================================
 
-    # ---------- PUSHABLE BOX HELPERS ----------
-    def _apply_box_dynamics(self):
-        """Reapply dynamics (including mass/frictions/damping) to current box."""
-        if self.box_id is None:
-            return
-        bx = self.cfg["box"]
-        p.changeDynamics(
-            self.box_id, -1,
-            mass=float(bx["mass_kg"]),
-            lateralFriction=float(bx["lateral_friction"]),
-            rollingFriction=float(bx["rolling_friction"]),
-            spinningFriction=float(bx["spinning_friction"]),
-            restitution=float(bx["restitution"]),
-            linearDamping=float(bx["linear_damping"]),
-            angularDamping=float(bx["angular_damping"]),
-        )
-
-    def _spawn_box(self):
-        """Spawn a dynamic box with physics & collision that the EE can push."""
-        if self.box_id is not None:
-            return  # Already present
-
-        bx = self.cfg.get("box", {})
-        half = float(bx.get("half_extents_m", 0.05))
-        mass = float(bx.get("mass_kg", 1.0))
-        color = bx.get("color", [0.2, 0.6, 1.0, 1.0])
-
-        # Start position; ensure z >= half so it rests on the plane (z=0)
-        sx, sy, sz = bx.get("start_pos_m", [0.30, 0.00, half])
-        sz = max(float(sz), half)
-        pos = [float(sx), float(sy), sz]
-        orn = [0.0, 0.0, 0.0, 1.0]
-
-        # Shapes
-        col_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=[half, half, half])
-        vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[half, half, half], rgbaColor=color)
-
-        # Body
-        self.box_id = p.createMultiBody(
-            baseMass=mass,
-            baseCollisionShapeIndex=col_id,
-            baseVisualShapeIndex=vis_id,
-            basePosition=pos,
-            baseOrientation=orn,
-        )
-
-        # Apply full dynamics config
-        self._apply_box_dynamics()
-
-        if self.app:
-            size_cm = 2*half*100.0
-            self.app.log(f"Box added: {size_cm:.0f} cm cube, {mass:.2f} kg at ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) m.")
-
-    def _remove_box(self):
-        """Remove the pushable box if it exists."""
-        if self.box_id is not None:
-            try:
-                p.removeBody(self.box_id)
-            except Exception:
-                pass
-            self.box_id = None
-            if self.app:
-                self.app.log("Box removed from scene.")
-
-    def _set_box_mass(self, mass_kg: float):
-        """Update mass live and reapply friction/damping so physics reflect the change."""
-        self.cfg["box"]["mass_kg"] = float(mass_kg)
-        if self.box_id is not None:
-            self._apply_box_dynamics()
-            if self.app:
-                self.app.log(f"Box mass set to {mass_kg:.2f} kg (dynamics updated)")
-
-    def _set_box_size(self, half_m: float):
-        """Respawn with new collision shape/inertia; keep pose if present."""
-        half_m = float(half_m)
-        self.cfg["box"]["half_extents_m"] = half_m
-        if self.box_id is not None:
-            pos, orn = p.getBasePositionAndOrientation(self.box_id)
-            pos = list(pos)
-            pos[2] = max(pos[2], half_m)  # keep above plane
-            self._remove_box()
-            old = self.cfg["box"]["start_pos_m"]
-            self.cfg["box"]["start_pos_m"] = pos
-            self._spawn_box()             # applies dynamics
-            self.cfg["box"]["start_pos_m"] = old
-            if self.app:
-                side_cm = 2*half_m*100
-                self.app.log(f"Box size set to {side_cm:.0f} cm (respawned with new inertia)")
-
-    def _respawn_box_at(self, x_m: float, y_m: float):
-        """Remove any existing box and respawn one at (x,y) on plane with current size/mass."""
-        half = float(self.cfg["box"]["half_extents_m"])
-        pos = [float(x_m), float(y_m), half]  # sit on plane
-        if self.box_id is not None:
-            self._remove_box()
-        old = self.cfg["box"]["start_pos_m"]
-        self.cfg["box"]["start_pos_m"] = pos
-        self._spawn_box()  # applies dynamics with current mass/frictions/damping
-        self.cfg["box"]["start_pos_m"] = old
-        if self.app:
-            side_cm = 2*half*100
-            self.app.log(f"Box respawned at cursor ({x_m:.2f}, {y_m:.2f}, {half:.3f}) m, side {side_cm:.0f} cm")
-
     def _check_collision(self) -> bool:
         is_colliding = False
         env_contacts = p.getClosestPoints(self.robot, self.plane, distance=0.0)
@@ -673,19 +580,6 @@ class SimulationController:
                 for i, slew in enumerate(self.j_slews):
                     slew.reset(current_j_pos[i])
                 print("[Simulation] Slews reset")
-            elif cmd == 'set_box':
-                want_on = bool(val)
-                if want_on:
-                    self._spawn_box()
-                else:
-                    self._remove_box()
-            elif cmd == 'set_box_mass':
-                self._set_box_mass(float(val))
-            elif cmd == 'set_box_size':
-                self._set_box_size(float(val))
-            elif cmd == 'respawn_box_at':
-                x_m, y_m = val
-                self._respawn_box_at(float(x_m), float(y_m))
         except queue.Empty:
             pass
 
@@ -785,6 +679,8 @@ class SimulationController:
                         self.fixed_z = self.shared['tuning']['j1_z_height_m']
                     self._update_target(dt)
 
+                self._update_target_marker()
+
                 # --- Simulation Step ---
                 self._ik_and_drive()
                 p.stepSimulation()
@@ -852,21 +748,11 @@ class SimulationController:
                 self._update_shared()
                 #=============================================================================================================================
                 # -------------------------
-                # Event marking (force on/off + optional box contact)
+                # Event marking (force on/off)
                 # -------------------------
-                # contact_on = True if EE is touching the box (only if box exists)
-                contact_on = False
-                if self.box_id is not None:
-                    try:
-                        # If any contact points exist between robot and box, mark contact
-                        cps = p.getContactPoints(bodyA=self.robot, bodyB=self.box_id)
-                        contact_on = len(cps) > 0
-                    except Exception:
-                        contact_on = False
-
-                # Use a threshold slightly ABOVE your deadzone to detect "active interaction"
+                # Event marking (force on/off)
                 force_on_thresh = max(1.5 * float(self.cfg["admittance"].get("force_deadzone_N", 0.5)), 0.5)
-                self.trial = update_trial_state(self.trial, Fx, Fy, force_on_thresh, contact_on)
+                self.trial = update_trial_state(self.trial, Fx, Fy, force_on_thresh, False)
 
                 # -------------------------
                 # Gather states for logging
@@ -880,15 +766,6 @@ class SimulationController:
                 # joints
                 qs = [p.getJointState(self.robot, j)[0] for j in self.joint_indices]
 
-                # box pose (optional)
-                box_on = 1 if (self.box_id is not None) else 0
-                box_pos = ("", "", "")
-                if self.box_id is not None:
-                    try:
-                        bp, _bo = p.getBasePositionAndOrientation(self.box_id)
-                        box_pos = (bp[0], bp[1], bp[2])
-                    except Exception:
-                        box_pos = ("", "", "")
 
                 # velocities for logging (ensure attributes exist)
                 vx_adm = getattr(self, "_vx_adm", 0.0)
@@ -915,9 +792,6 @@ class SimulationController:
                     "x_tgt_m": self.ee_target[0], "y_tgt_m": self.ee_target[1], "z_tgt_m": self.ee_target[2],
 
                     "q1": qs[0], "q2": qs[1], "q3": qs[2], "q4": qs[3],
-
-                    "box_on": box_on,
-                    "box_x_m": box_pos[0], "box_y_m": box_pos[1], "box_z_m": box_pos[2],
 
                     "force_on": int(self.trial.force_on),
                     "contact_on": int(self.trial.contact_on),
@@ -1100,7 +974,7 @@ class Gui(tk.Tk):
         self.collision_var.trace_add('write', self._update_collision_state)
         self.ee_trail = deque(maxlen=50)
         self.force_history = deque(maxlen=200)  # Store (Fx, Fy) tuples
-        self.cursor_xy_m: Tuple[float,float] = (CONFIG['box']['start_pos_m'][0], CONFIG['box']['start_pos_m'][1])
+        self.cursor_xy_m: Tuple[float, float] = (0.3, 0.0)
         self.cursor_marker = None
         self._build()
         self._draw_workspace()
@@ -1164,37 +1038,6 @@ class Gui(tk.Tk):
         ttk.Button(controls, text="Return Home", command=lambda: self.cmd_q.put(('return_home', None))).pack(fill='x', pady=4)
         ttk.Button(controls, text="Reset Slews", command=lambda: self.cmd_q.put(('reset_slews', None))).pack(fill='x', pady=4)
         ttk.Checkbutton(controls, text="Enable Collision Stop", variable=self.collision_var).pack(fill='x', pady=4)
-
-        # Add Box toggle
-        self.add_box_var = tk.BooleanVar(value=False)
-        def _on_add_box_toggle(*_):
-            self.cmd_q.put(('set_box', self.add_box_var.get()))
-        self.add_box_var.trace_add('write', _on_add_box_toggle)
-        ttk.Checkbutton(controls, text="Add Box", variable=self.add_box_var).pack(fill='x', pady=4)
-
-        # ---- Box configuration (live sliders + respawn at cursor) ----
-        box_frame = ttk.LabelFrame(controls_col, text="Box", padding=8)
-        box_frame.pack(fill='x', pady=(8,0))
-
-        # Size slider (side length in cm)
-        ttk.Label(box_frame, text="Size (cm, side length)").pack(anchor='w')
-        self.box_size_cm = tk.DoubleVar(value=2*CONFIG['box']['half_extents_m']*100.0)
-        size_scale = tk.Scale(box_frame, variable=self.box_size_cm, from_=10.0, to=40.0,
-                              orient='horizontal', resolution=1.0, length=260,
-                              command=lambda _v: self._on_box_size_changed())
-        size_scale.pack(fill='x', pady=(0,6))
-
-        # Mass slider (kg)
-        ttk.Label(box_frame, text="Mass (kg)").pack(anchor='w')
-        self.box_mass_kg = tk.DoubleVar(value=CONFIG['box']['mass_kg'])
-        mass_scale = tk.Scale(box_frame, variable=self.box_mass_kg, from_=0.5, to=5.0,
-                              orient='horizontal', resolution=0.1, length=260,
-                              command=lambda _v: self._on_box_mass_changed())
-        mass_scale.pack(fill='x', pady=(0,6))
-
-        # Respawn at cursor button
-        ttk.Button(box_frame, text="Respawn Box at Cursor",
-                   command=lambda: self.cmd_q.put(('respawn_box_at', self.cursor_xy_m))).pack(fill='x')
 
         tuning = ttk.LabelFrame(controls_col, text="Tuning", padding=8)
         tuning.pack(fill='x', pady=(8,0))
@@ -1283,19 +1126,6 @@ class Gui(tk.Tk):
         # ==============================================================
         self.log(f"Cursor set to ({x_m:.3f}, {y_m:.3f}) m")
 
-    def _on_box_size_changed(self):
-        side_cm = float(self.box_size_cm.get())
-        half_m = (side_cm / 100.0) / 2.0
-        CONFIG['box']['half_extents_m'] = half_m
-        # Tell sim; it will respawn if needed, preserving current pose and reapplying dynamics
-        self.cmd_q.put(('set_box_size', half_m))
-
-    def _on_box_mass_changed(self):
-        mass = float(self.box_mass_kg.get())
-        CONFIG['box']['mass_kg'] = mass
-        # Tell sim; it will reapply dynamics immediately
-        self.cmd_q.put(('set_box_mass', mass))
-
     def _slider(self, parent, key, label, vmin, vmax, v0, step):
         var = tk.DoubleVar(value=v0)
         self.vars[key] = var
@@ -1340,9 +1170,6 @@ class Gui(tk.Tk):
             color = f"#{int(0x22 + alpha*0xdd):02x}{int(0xaa + alpha*0x55):02x}{int(0xaa):02x}"
             self.xy_canvas.create_oval(px-2, py-2, px+2, py+2, fill="", outline=color, width=1, tags="trail")
 
-        # tx_px = int(self.xy_half + (ee_target_mm[0]*self.mm_to_px))
-        # ty_px = int(self.xy_half - (ee_target_mm[1]*self.mm_to_px))
-        # self.xy_canvas.coords(self.ee_target_dot, tx_px-3, ty_px-3, tx_px+3, ty_px+3)
         with self.lock:
             tgt = self.shared.get('target_xy_m', None)
 
@@ -1351,7 +1178,6 @@ class Gui(tk.Tk):
             ty_px = int(self.xy_half - (tgt[1] * 1000.0) * self.mm_to_px)
             self.xy_canvas.coords(self.ee_target_dot, tx_px - 3, ty_px - 3, tx_px + 3, ty_px + 3)
         else:
-            # hide target dot if no target exists
             self.xy_canvas.coords(self.ee_target_dot, 0, 0, 0, 0)
             ###################################################################target sima
 

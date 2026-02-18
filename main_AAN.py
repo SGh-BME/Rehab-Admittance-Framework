@@ -1,5 +1,5 @@
 ####### --------------------------------------------------------
-#AAN ___ version 3
+# AAN __ version 3
 ####### --------------------------------------------------------
 
 import pybullet as p
@@ -72,6 +72,7 @@ CONFIG = {
         "position_gains": [0.35, 0.35, 0.35, 0.25],
         "forces": [2500]*4,
         "collision_active": True,
+        "return_home_speed_m_s": 0.5,
 
         "j_max_speed_rad_s": {
             'j2': math.radians(150.0),
@@ -614,6 +615,8 @@ class SimulationController:
             elif cmd == 'return_home':
                 print("[Simulation] Return Home sequence initiated.")
                 self.is_returning_home = True
+                with self.lock:
+                    self.shared['target_xy_m'] = None  # clear selected target so AAN won't pull back after arrival
                 # -------------------------------------------------------
                 ls = p.getLinkState(self.robot, self.ee_link, computeForwardKinematics=True)
                 ee = ls[4] if ls else self.ee_home
@@ -712,15 +715,26 @@ class SimulationController:
 
                 # --- Target Calculation ---
                 if self.is_returning_home:
-                    self.ee_target = self.ee_home[:]
+                    with self.lock:
+                        self.fixed_z = self.shared['tuning']['j1_z_height_m']
                     ls = p.getLinkState(self.robot, self.ee_link, computeForwardKinematics=True)
-                    ee_current = ls[4] if ls else self.ee_home
-                    dist_to_home = math.hypot(ee_current[0] - self.ee_home[0], ee_current[1] - self.ee_home[1])
-                    if dist_to_home < 0.01: # 1cm arrival threshold
+                    ee_current = list(ls[4]) if ls else self.ee_home[:]
+                    dx = self.ee_home[0] - ee_current[0]
+                    dy = self.ee_home[1] - ee_current[1]
+                    dist_to_home = math.hypot(dx, dy)
+                    if dist_to_home < 0.01:  # 1 cm arrival threshold
                         print("[Simulation] Arrived home.")
                         self.is_returning_home = False
                         self.vx_slew.reset(0.0)
                         self.vy_slew.reset(0.0)
+                        self.ee_target = self.ee_home[:]
+                    else:
+                        speed = float(self.cfg['control'].get('return_home_speed_m_s', 0.05))
+                        step = min(speed * dt, dist_to_home)
+                        scale = step / dist_to_home if dist_to_home > 1e-9 else 1.0
+                        self.ee_target[0] = ee_current[0] + dx * scale
+                        self.ee_target[1] = ee_current[1] + dy * scale
+                        self.ee_target[2] = self.fixed_z
                 else:
                     with self.lock:
                         self.fixed_z = self.shared['tuning']['j1_z_height_m']

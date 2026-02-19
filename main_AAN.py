@@ -1,5 +1,39 @@
 ####### --------------------------------------------------------
-# AAN __ version 3
+# AAN __ version 3, Joysticksimulationv4_FHsensor_control4_log_tgt2.py, admittance_controller.py
+
+# Summary of current AAN setup:
+# Core mechanism:
+# Target-based admittance control with time-varying stiffness: M ẍ + D ẋ + K_d(t)(x - x_d) = F_ext
+# Stiffness K_d(t) varies between K_min and K_max based on user engagement and task difficulty
+# Assistance modulation:
+# Activation signal: η(t) = w_F(t) · w_e(t)
+# w_F: Engagement weight from force magnitude only (not direction)
+# High force → high w_F
+# Low force → low w_F
+# w_e: Task error weight from distance to target
+# Far from target → high w_e
+# Near target → low w_e
+# Filtered: η_f via low-pass filter for smooth transitions
+# Stiffness: K_d(t) = K_min + (K_max - K_min) · η_f(t)
+# Behavior:
+# High assistance when:
+# User applies high force (any direction) and is far from target
+# Spring pulls strongly toward target
+# Low assistance when:
+# User applies low force (or is near target)
+# Approaches free-floating behavior (K_d → K_min)
+# Force direction:
+# Not considered; only magnitude matters
+# Pushing toward target: spring helps (assistance)
+# Pushing away: spring resists (guidance/resistance)
+# Perpendicular: spring still pulls toward target
+# Key characteristics:
+# Smooth transitions between free-floating and fully assisted modes
+# Magnitude-based engagement (direction-agnostic)
+# Distance-based task difficulty
+# Always guides toward target when assistance is active
+# Stable (K_d(t) remains positive semi-definite)
+# Use case: Suitable for rehabilitation where guidance toward the target is desired, even if the user pushes away. Less suitable if free exploration in any direction is needed.
 ####### --------------------------------------------------------
 
 import pybullet as p
@@ -19,12 +53,11 @@ import sys
 from admittance_controller import (
     AdmittanceParams,
     TargetAdmittanceState,
-    step_target_admittance_AAN,   # NEW
-    AANParams,                    # NEW
-    AANState,                     # NEW
+    step_target_admittance_AAN,  # NEW
+    AANParams,  # NEW
+    AANState,  # NEW
     reset_target_admittance_state,
 )
-
 
 from functions import DataLogger, TrialState, update_trial_state
 import datetime
@@ -39,7 +72,8 @@ CONFIG = {
         "Kx": 5, "Ky": 5,
         "force_deadzone_N": 0.5,
         "force_max_N": 25.0,
-        "v_max_mps": 0.35
+        "v_max_mps": 0.35,
+        "force_lpf_alpha": 0.12,
     },
     "robot": {
         "urdf_path": "D:/Sima-uni/CodesPycharm/HitBot_2026_V1/Joystick control/Joystick control/robot32_description/urdf/robot32_for_pybullet.urdf",
@@ -62,7 +96,7 @@ CONFIG = {
         "xy_angle_max_deg": 90.0,
     },
     "simulation": {
-        "time_step": 1/480.0,
+        "time_step": 1 / 480.0,
         "gravity": [0, 0, -9.81]
     },
     "control": {
@@ -70,7 +104,7 @@ CONFIG = {
         "ik_residual_thresh": 1e-4,
         "ik_damping": 0.05,
         "position_gains": [0.35, 0.35, 0.35, 0.25],
-        "forces": [2500]*4,
+        "forces": [2500] * 4,
         "collision_active": True,
         "return_home_speed_m_s": 0.5,
 
@@ -109,6 +143,7 @@ CONFIG = {
     },
 }
 
+
 # =============================================================================
 # === HELPERS
 # =============================================================================
@@ -116,18 +151,22 @@ class MovingAverage:
     def __init__(self, n: int = 10):
         self.q = deque(maxlen=max(2, n))
         self.sum = 0.0
+
     def add(self, x: float) -> float:
         if len(self.q) == self.q.maxlen:
             self.sum -= self.q[0]
         self.q.append(x)
         self.sum += x
         return x
+
     def value(self) -> float:
-        return self.sum/len(self.q) if self.q else 0.0
+        return self.sum / len(self.q) if self.q else 0.0
+
 
 class HysteresisDeadzone:
     def __init__(self, inner: float, outer: float):
         self.inner, self.outer, self.active = float(inner), float(outer), False
+
     def apply(self, x: float) -> float:
         ax = abs(x)
         if self.active:
@@ -141,13 +180,17 @@ class HysteresisDeadzone:
                 return x
             return 0.0
 
+
 class SlewLimiter:
     def __init__(self, max_delta_per_sec: float, initial: float = 0.0):
         self.max_delta = float(max_delta_per_sec)
         self.prev = float(initial)
         self.last_t = time.perf_counter()
+
     def reset(self, value: float = 0.0):
-        self.prev = float(value); self.last_t = time.perf_counter()
+        self.prev = float(value);
+        self.last_t = time.perf_counter()
+
     def step(self, target: float) -> float:
         now = time.perf_counter()
         dt = max(1e-4, now - self.last_t)
@@ -158,21 +201,27 @@ class SlewLimiter:
         self.prev += delta
         return self.prev
 
+
 class AngleFilter:
     def __init__(self, alpha: float = 0.50, initial: float = 0.0):
-        self.alpha = float(alpha); self.value = float(initial)
+        self.alpha = float(alpha);
+        self.value = float(initial)
+
     @staticmethod
     def wrap180(d):
         w = (d + 180.0) % 360.0 - 180.0
         return w if w != -180.0 else 180.0
+
     def update(self, new_deg: float) -> float:
         e = self.wrap180(new_deg - self.value)
-        self.value = self.wrap180(self.value + self.alpha*e)
+        self.value = self.wrap180(self.value + self.alpha * e)
         return self.value
 
+
 def shaped_mag(mag: float, max_mag: float, power: float) -> float:
-    m = max(0.0, min(1.0, mag/max(max_mag,1e-6)))
-    return (m**max(1.0,power))*max_mag
+    m = max(0.0, min(1.0, mag / max(max_mag, 1e-6)))
+    return (m ** max(1.0, power)) * max_mag
+
 
 # ================= FORCE SENSOR HELPERS =================
 def hex_to_force_moment(hex_bytes, scale_factor, mid_value=0x80000, half_range=0x40000):
@@ -181,6 +230,7 @@ def hex_to_force_moment(hex_bytes, scale_factor, mid_value=0x80000, half_range=0
         return ((decimal_value - mid_value) / half_range) * scale_factor
     except Exception:
         return 0.0
+
 
 class ForceSensorReader:
     def __init__(self, port="COM3", baud=921600, scale_N=300.0):
@@ -217,9 +267,9 @@ class ForceSensorReader:
     def _loop(self):
         while not self._stop.is_set():
             try:
-                self.ser.write(b'P')        # request packet
+                self.ser.write(b'P')  # request packet
                 self.ser.flush()
-                resp = self.ser.read(36)    # expected length
+                resp = self.ser.read(36)  # expected length
                 if len(resp) >= 11:
                     fx_hex = resp[1:6]
                     fy_hex = resp[6:11]
@@ -234,6 +284,8 @@ class ForceSensorReader:
     def get_fx_fy(self):
         with self.lock:
             return self.fx, self.fy
+
+
 # =============================================================================
 
 
@@ -244,6 +296,7 @@ try:
     import serial
 except ImportError:
     serial = None
+
 
 class JoystickReader:
     def __init__(self, cfg: Dict, sm: Dict, shared: Dict, lock: threading.RLock):
@@ -272,7 +325,8 @@ class JoystickReader:
         if self.ser:
             try:
                 self.ser.reset_input_buffer()
-                self.ser.write(b't'); self.ser.flush()
+                self.ser.write(b't');
+                self.ser.flush()
                 time.sleep(0.25)
                 print("[Joystick] Tare sent")
             except Exception as e:
@@ -281,13 +335,16 @@ class JoystickReader:
     def stop(self):
         self._stop.set()
         if self.ser:
-            try: self.ser.close()
-            except: pass
+            try:
+                self.ser.close()
+            except:
+                pass
 
     def _loop(self):
         while not self._stop.is_set():
             if not self.ser:
-                time.sleep(0.05); continue
+                time.sleep(0.05);
+                continue
             try:
                 raw_data = self.ser.read(self.ser.in_waiting or 1).decode('utf-8', errors='ignore')
                 self.buffer += raw_data
@@ -338,12 +395,13 @@ class SimulationController:
         self.plane = None
         self.collision_state_color = None
         self.joint_indices = []
-        self.ll = []; self.ul = []
+        self.ll = [];
+        self.ul = []
         self.ee_link = -1
         self.base_link = -1
         self.physical_home = None
-        self.ee_home = [0.0,0.0,0.0]
-        self.ee_target = [0.0,0.0,0.0]
+        self.ee_home = [0.0, 0.0, 0.0]
+        self.ee_target = [0.0, 0.0, 0.0]
         self.fixed_z = 0.0
         self.vx_slew = SlewLimiter(self.cfg["ee"]["vel_slew_mps2"], 0.0)
         self.vy_slew = SlewLimiter(self.cfg["ee"]["vel_slew_mps2"], 0.0)
@@ -358,6 +416,7 @@ class SimulationController:
         # We still read Kx/Ky from config, but they become K_max for AAN scheduling
         Kx_cfg = float(adm.pop("Kx", 5.0))
         Ky_cfg = float(adm.pop("Ky", 5.0))
+        adm.pop("force_lpf_alpha", None)  # sim-only, not part of AdmittanceParams
 
         # Admittance base params (Mx,My,Bx,By, force shaping, v_max)
         self.adm_params = AdmittanceParams(**adm) if adm else AdmittanceParams()
@@ -382,6 +441,10 @@ class SimulationController:
             need_deadband=0.02,
         )
         self.aan_state = AANState()
+
+        # Force low-pass filter state (reduces jitter)
+        self._Fx_filt = 0.0
+        self._Fy_filt = 0.0
 
         # =====================================================
 
@@ -503,7 +566,8 @@ class SimulationController:
         if not os.path.exists(urdf):
             raise FileNotFoundError(f"URDF not found: {urdf}")
         p.setAdditionalSearchPath(os.path.dirname(urdf))
-        self.robot = p.loadURDF(urdf, [0, 0, 0.01], p.getQuaternionFromEuler([0, 0, 0]), useFixedBase=True, flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
+        self.robot = p.loadURDF(urdf, [0, 0, 0.01], p.getQuaternionFromEuler([0, 0, 0]), useFixedBase=True,
+                                flags=p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
         self.base_link = -1
 
     def _identify_by_name(self):
@@ -519,7 +583,7 @@ class SimulationController:
         except KeyError as e:
             raise RuntimeError(f"Missing joint in URDF: {e}")
 
-        self.joint_indices = [j1,j2,j3,j4]
+        self.joint_indices = [j1, j2, j3, j4]
         self.ee_link = j4
         infos = [p.getJointInfo(self.robot, i) for i in self.joint_indices]
         self.ll = [inf[8] for inf in infos]
@@ -550,12 +614,12 @@ class SimulationController:
         cfg = self.cfg['robot']
         home = cfg['physical_home_angles_deg']
         rng = cfg['max_ext_mm'] - cfg['home_ext_mm']
-        percent = (logical['j1'] - cfg['home_ext_mm'])/rng if rng else 0.0
-        j1 = self.ll[0] + percent*(self.ul[0]-self.ll[0])
+        percent = (logical['j1'] - cfg['home_ext_mm']) / rng if rng else 0.0
+        j1 = self.ll[0] + percent * (self.ul[0] - self.ll[0])
         j2 = math.radians(logical['j2'] + home['j2'])
         j3 = math.radians(-logical['j3'] + home['j3'])
         j4 = math.radians(logical['j4'] + home['j4'])
-        return [j1,j2,j3,j4]
+        return [j1, j2, j3, j4]
 
     def _initialize_pose(self):
         logical_home = {'j1': self.cfg['robot']['home_ext_mm'], 'j2': 0.0, 'j3': 0.0, 'j4': 0.0}
@@ -563,7 +627,7 @@ class SimulationController:
         for idx, j in enumerate(self.joint_indices):
             p.resetJointState(self.robot, j, self.physical_home[idx])
         ls = p.getLinkState(self.robot, self.ee_link, computeForwardKinematics=True)
-        ee = list(ls[4]) if ls else [0.0,0.0,self.cfg['robot']['j1_z_height_m']]
+        ee = list(ls[4]) if ls else [0.0, 0.0, self.cfg['robot']['j1_z_height_m']]
         self.ee_home = ee[:]
         home_xy = self.cfg['robot'].get('ee_home_xy_m')
         if home_xy is not None and len(home_xy) >= 2:
@@ -578,18 +642,18 @@ class SimulationController:
 
     def stop(self):
         self._stop.set()
-        #==========================================================
+        # ==========================================================
         if hasattr(self, "logger") and self.logger:
             self.logger.close()
             if self.app:
                 self.app.log(f"Saved log: {self.log_path}")
-        #===========================================================
+        # ===========================================================
 
     def _check_collision(self) -> bool:
         is_colliding = False
         env_contacts = p.getClosestPoints(self.robot, self.plane, distance=0.0)
         if env_contacts:
-             is_colliding = True
+            is_colliding = True
         if not is_colliding:
             ee_contacts = p.getClosestPoints(self.robot, self.robot, distance=0.0,
                                              linkIndexA=self.base_link, linkIndexB=self.ee_link)
@@ -600,14 +664,15 @@ class SimulationController:
 
     def _process_cmds(self):
         try:
-            cmd,val = self.cmd_q.get_nowait()
+            cmd, val = self.cmd_q.get_nowait()
             if cmd == 'recalibrate_center':
-                samples=[]; t0=time.perf_counter()
-                while time.perf_counter()-t0 < 0.3:
+                samples = [];
+                t0 = time.perf_counter()
+                while time.perf_counter() - t0 < 0.3:
                     with self.lock:
-                        samples.append(self.shared.get('joystick_state',{}).get('raw_angle_360',0.0))
+                        samples.append(self.shared.get('joystick_state', {}).get('raw_angle_360', 0.0))
                     time.sleep(0.01)
-                raw = sum(samples)/max(1,len(samples))
+                raw = sum(samples) / max(1, len(samples))
                 with self.lock:
                     self.shared['tuning']['heading_offset_360'] = raw % 360.0
                     if 'joystick' in self.shared: self.shared['joystick'].tare()
@@ -630,6 +695,10 @@ class SimulationController:
                 for i, slew in enumerate(self.j_slews):
                     slew.reset(current_j_pos[i])
                 print("[Simulation] Slews reset")
+            elif cmd == 'zero_force_filter':
+                self._Fx_filt = 0.0
+                self._Fy_filt = 0.0
+                print("[Simulation] Force filter zeroed.")
         except queue.Empty:
             pass
 
@@ -655,8 +724,15 @@ class SimulationController:
                 if fs is not None:
                     Fx, Fy = fs.get_fx_fy()
 
-                # Optional: deadzone in N (use your CONFIG values)
                 adm_cfg = self.cfg.get("admittance", {})
+                # Low-pass filter force to reduce jitter (alpha: 0=smooth/slow, 1=no filter)
+                lpf_alpha = float(adm_cfg.get("force_lpf_alpha", 0.12))
+                lpf_alpha = max(0.01, min(1.0, lpf_alpha))
+                self._Fx_filt = (1.0 - lpf_alpha) * self._Fx_filt + lpf_alpha * Fx
+                self._Fy_filt = (1.0 - lpf_alpha) * self._Fy_filt + lpf_alpha * Fy
+                Fx, Fy = self._Fx_filt, self._Fy_filt
+
+                # Optional: deadzone in N (use your CONFIG values)
                 dz = float(adm_cfg.get("force_deadzone_N", 0.0))
                 Fx = 0.0 if abs(Fx) < dz else Fx
                 Fy = 0.0 if abs(Fy) < dz else Fy
@@ -686,30 +762,30 @@ class SimulationController:
                         "raw_angle_360": ang_deg
                     }
 
-                 # # deadzone in N (tune)
-                # if abs(Fx) < 1.0: Fx = 0.0
-                # if abs(Fy) < 1.0: Fy = 0.0
-                #
-                # mag_N = math.hypot(Fx, Fy)
-                # angle_deg = (math.degrees(math.atan2(Fx, Fy)) + 360.0) % 360.0
-                #
-                # F_full_N = 20.0  # tune this
-                # mag_kg_equiv = min(
-                #     CONFIG['smooth']['max_mag_kg'],
-                #     (mag_N / F_full_N) * CONFIG['smooth']['max_mag_kg']
-                # )
-                # with self.lock:
-                #     self.shared["joystick_state"] = {
-                #         "mag_kg": mag_kg_equiv,
-                #         "ang_deg_360": angle_deg,
-                #         "raw_angle_360": angle_deg
-                #     }
+                    # # deadzone in N (tune)
+                    # if abs(Fx) < 1.0: Fx = 0.0
+                    # if abs(Fy) < 1.0: Fy = 0.0
+                    #
+                    # mag_N = math.hypot(Fx, Fy)
+                    # angle_deg = (math.degrees(math.atan2(Fx, Fy)) + 360.0) % 360.0
+                    #
+                    # F_full_N = 20.0  # tune this
+                    # mag_kg_equiv = min(
+                    #     CONFIG['smooth']['max_mag_kg'],
+                    #     (mag_N / F_full_N) * CONFIG['smooth']['max_mag_kg']
+                    # )
+                    # with self.lock:
+                    #     self.shared["joystick_state"] = {
+                    #         "mag_kg": mag_kg_equiv,
+                    #         "ang_deg_360": angle_deg,
+                    #         "raw_angle_360": angle_deg
+                    #     }
                     js_mag = mag_kg_equiv  # keep existing logic below working
                     # Cancel Return Home if user applies force
                     if self.is_returning_home and js_mag > 0.1:
                         print("[Simulation] Return Home cancelled by input.")
                         self.is_returning_home = False
-                #=========================================================================================
+                # =========================================================================================
 
                 # self._process_cmds()
 
@@ -804,10 +880,11 @@ class SimulationController:
                             p.changeVisualShape(self.robot, i, rgbaColor=[1, 1, 1, 1])
                         self.collision_state_color = "WHITE"
                     with self.lock:
-                        self.shared['last_safe_positions'] = [s[0] for s in p.getJointStates(self.robot, self.joint_indices)]
+                        self.shared['last_safe_positions'] = [s[0] for s in
+                                                              p.getJointStates(self.robot, self.joint_indices)]
 
                 self._update_shared()
-                #=============================================================================================================================
+                # =============================================================================================================================
                 # -------------------------
                 # Event marking (force on/off)
                 # -------------------------
@@ -827,13 +904,11 @@ class SimulationController:
                 # joints
                 qs = [p.getJointState(self.robot, j)[0] for j in self.joint_indices]
 
-
                 # velocities for logging (ensure attributes exist)
                 vx_adm = getattr(self, "_vx_adm", 0.0)
                 vy_adm = getattr(self, "_vy_adm", 0.0)
                 vx_cmd = getattr(self, "_vx_cmd", 0.0)
                 vy_cmd = getattr(self, "_vy_cmd", 0.0)
-
 
                 row = {
                     "t": t_now,
@@ -869,7 +944,7 @@ class SimulationController:
                 # Flush occasionally (not every step, for speed)
                 if int(t_now * 10) % 10 == 0:  # about once per second
                     self.logger.flush()
-                #==============================================================================================================================
+                # ==============================================================================================================================
 
                 time.sleep(dt)
             except Exception as e:
@@ -977,7 +1052,7 @@ class SimulationController:
 
     def _update_shared(self):
         ls = p.getLinkState(self.robot, self.ee_link, computeForwardKinematics=True)
-        ee = ls[4] if ls else (0.0,0.0,0.0)
+        ee = ls[4] if ls else (0.0, 0.0, 0.0)
         t_now = time.perf_counter()
         if self._last_ee is not None and self._last_t is not None:
             dt = max(1e-4, t_now - self._last_t)
@@ -989,7 +1064,7 @@ class SimulationController:
             self.speed_ma.add(raw_speed)
             smoothed = self.speed_ma.value()
             # small threshold to kill jitter when basically stopped
-            if smoothed < 1e-3:   # < 1 mm/s
+            if smoothed < 1e-3:  # < 1 mm/s
                 smoothed = 0.0
             self.ee_speed_mps = smoothed
         self._last_ee, self._last_t = ee, t_now
@@ -1002,18 +1077,21 @@ class SimulationController:
                 CONFIG['smooth']['max_mag_kg'],
                 self.shared['tuning'].get('curve_pow', CONFIG['smooth']['curve_pow'])
             )
-            self.shared['ee_pos_mm'] = [c*1000.0 for c in ee]
-            self.shared['ee_speed_mm_s'] = self.ee_speed_mps*1000.0
-            self.shared['ee_target_mm'] = [c*1000.0 for c in self.ee_target]
+            self.shared['ee_pos_mm'] = [c * 1000.0 for c in ee]
+            self.shared['ee_speed_mm_s'] = self.ee_speed_mps * 1000.0
+            self.shared['ee_target_mm'] = [c * 1000.0 for c in self.ee_target]
             self.shared['joystick_norm_mag'] = norm_shaped_kg
             joint_states = p.getJointStates(self.robot, self.joint_indices)
             logical_angles_deg = {
-                'j1_mm': (joint_states[0][0] - self.ll[0]) / (self.ul[0] - self.ll[0]) * (self.cfg['robot']['max_ext_mm'] - self.cfg['robot']['home_ext_mm']) + self.cfg['robot']['home_ext_mm'],
+                'j1_mm': (joint_states[0][0] - self.ll[0]) / (self.ul[0] - self.ll[0]) * (
+                            self.cfg['robot']['max_ext_mm'] - self.cfg['robot']['home_ext_mm']) + self.cfg['robot'][
+                             'home_ext_mm'],
                 'j2_deg': math.degrees(joint_states[1][0]) - self.cfg['robot']['physical_home_angles_deg']['j2'],
                 'j3_deg': -(math.degrees(joint_states[2][0]) - self.cfg['robot']['physical_home_angles_deg']['j3']),
                 'j4_deg': math.degrees(joint_states[3][0]) - self.cfg['robot']['physical_home_angles_deg']['j4']
             }
             self.shared['joint_angles_deg'] = logical_angles_deg
+
 
 # =============================================================================
 # === GUI
@@ -1024,11 +1102,11 @@ class Gui(tk.Tk):
         self.cmd_q, self.shared, self.lock = cmd_q, shared, lock
         self.title("Robot EE Control (IK · Responsive)")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.refresh_ms = int(1000.0/CONFIG['ui']['refresh_hz'])
-        self.xy_px    = CONFIG['ui']['xy_canvas_px']
-        self.joy_px   = CONFIG['ui']['joy_canvas_px']
-        self.xy_half = self.xy_px//2
-        self.joy_half= self.joy_px//2
+        self.refresh_ms = int(1000.0 / CONFIG['ui']['refresh_hz'])
+        self.xy_px = CONFIG['ui']['xy_canvas_px']
+        self.joy_px = CONFIG['ui']['joy_canvas_px']
+        self.xy_half = self.xy_px // 2
+        self.joy_half = self.joy_px // 2
         self.mm_extent = CONFIG['ui']['xy_extent_mm']
         self.mm_to_px = self.xy_half / self.mm_extent  # px per mm
         self.collision_var = tk.BooleanVar(value=CONFIG['control']['collision_active'])
@@ -1041,13 +1119,14 @@ class Gui(tk.Tk):
         self._draw_workspace()
         self._tick()
 
-    def _zero_force_sensor(self): #Sima for force =============
+    def _zero_force_sensor(self):  # Sima for force =============
         with self.lock:
             fs = self.shared.get('force_sensor', None)
         if fs is not None:
             fs.zero()
             self.log("Force sensor zeroed (tare).")
         else:
+            self.cmd_q.put(('zero_force_filter', None))
             self.log("Force sensor not connected.")
 
     def _update_collision_state(self, *args):
@@ -1067,13 +1146,16 @@ class Gui(tk.Tk):
         self.xy_canvas.create_oval(x_min_home, y_min_home, x_max_home, y_max_home, outline='#b0b0ff', width=1)
         self.xy_canvas.create_line(self.xy_half, 0, self.xy_half, self.xy_px, fill="#ddd")
         self.xy_canvas.create_line(0, self.xy_half, self.xy_px, self.xy_half, fill="#ddd")
-        self.xy_canvas.create_oval(self.xy_half-2, self.xy_half-2, self.xy_half+2, self.xy_half+2, fill='gray', outline='')
-        self.xy_canvas.create_text(self.xy_px - 10, self.xy_half, text="+X", anchor='e', font=('Arial',8))
-        self.xy_canvas.create_text(self.xy_half, 10, text="+Y", anchor='n', font=('Arial',8))
-        for dist_mm in range(200, int(self.mm_extent)+1, 200):
+        self.xy_canvas.create_oval(self.xy_half - 2, self.xy_half - 2, self.xy_half + 2, self.xy_half + 2, fill='gray',
+                                   outline='')
+        self.xy_canvas.create_text(self.xy_px - 10, self.xy_half, text="+X", anchor='e', font=('Arial', 8))
+        self.xy_canvas.create_text(self.xy_half, 10, text="+Y", anchor='n', font=('Arial', 8))
+        for dist_mm in range(200, int(self.mm_extent) + 1, 200):
             px = int(dist_mm * self.mm_to_px)
-            self.xy_canvas.create_text(self.xy_half + px, self.xy_half + 5, text=f"{dist_mm}", font=('Arial',6), anchor='n')
-            self.xy_canvas.create_text(self.xy_half + 5, self.xy_half - px, text=f"{dist_mm}", font=('Arial',6), anchor='w')
+            self.xy_canvas.create_text(self.xy_half + px, self.xy_half + 5, text=f"{dist_mm}", font=('Arial', 6),
+                                       anchor='n')
+            self.xy_canvas.create_text(self.xy_half + 5, self.xy_half - px, text=f"{dist_mm}", font=('Arial', 6),
+                                       anchor='w')
 
         # Initial cursor marker
         self._draw_cursor_marker()
@@ -1084,35 +1166,40 @@ class Gui(tk.Tk):
         self.columnconfigure(0, weight=1)
         main.columnconfigure(0, weight=1)
         left = ttk.Frame(main)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0,10))
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
         left.columnconfigure(0, weight=0)
         left.columnconfigure(1, weight=1)
 
         controls_col = ttk.Frame(left)
-        controls_col.grid(row=0, column=0, sticky="nsw", padx=(0,10))
+        controls_col.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
         controls = ttk.LabelFrame(controls_col, text="Controls", padding=8)
         controls.pack(fill='x')
 
-        ttk.Button(controls, text="Zero Force Sensor", command=self._zero_force_sensor).pack(fill='x', pady=4)# Sima for force ########
+        ttk.Button(controls, text="Zero Force Sensor", command=self._zero_force_sensor).pack(fill='x',
+                                                                                             pady=4)  # Sima for force ########
 
-        ttk.Button(controls, text="Recalibrate Center", command=lambda: self.cmd_q.put(('recalibrate_center', None))).pack(fill='x', pady=4)
-        ttk.Button(controls, text="Return Home", command=lambda: self.cmd_q.put(('return_home', None))).pack(fill='x', pady=4)
-        ttk.Button(controls, text="Reset Slews", command=lambda: self.cmd_q.put(('reset_slews', None))).pack(fill='x', pady=4)
+        ttk.Button(controls, text="Recalibrate Center",
+                   command=lambda: self.cmd_q.put(('recalibrate_center', None))).pack(fill='x', pady=4)
+        ttk.Button(controls, text="Return Home", command=lambda: self.cmd_q.put(('return_home', None))).pack(fill='x',
+                                                                                                             pady=4)
+        ttk.Button(controls, text="Reset Slews", command=lambda: self.cmd_q.put(('reset_slews', None))).pack(fill='x',
+                                                                                                             pady=4)
         ttk.Checkbutton(controls, text="Enable Collision Stop", variable=self.collision_var).pack(fill='x', pady=4)
 
         tuning = ttk.LabelFrame(controls_col, text="Tuning", padding=8)
-        tuning.pack(fill='x', pady=(8,0))
+        tuning.pack(fill='x', pady=(8, 0))
         self.vars = {}
         self.value_labels = {}
         max_speed_deg_s = CONFIG['ee']['max_speed_control_deg_s']
-        self._slider(tuning, 'ee_speed_mm_s', f"Joint Max Speed ({chr(176)}/s)", 10.0, max_speed_deg_s, max_speed_deg_s, 5.0)
+        self._slider(tuning, 'ee_speed_mm_s', f"Joint Max Speed ({chr(176)}/s)", 10.0, max_speed_deg_s, max_speed_deg_s,
+                     5.0)
         self._slider(tuning, 'curve_pow', "Curve Power", 1.0, 3.0, CONFIG['smooth']['curve_pow'], 0.05)
         j1_min_m, j1_max_m = CONFIG['robot']['j1_z_limits_m']
         j1_default_m = CONFIG['robot']['j1_z_height_m']
         self._slider(tuning, 'j1_z_height_m', "Z Height (m)", j1_min_m, j1_max_m, j1_default_m, 0.01)
 
         targets_frame = ttk.LabelFrame(controls_col, text="Targets", padding=8)
-        targets_frame.pack(fill='x', pady=(8,0))
+        targets_frame.pack(fill='x', pady=(8, 0))
         self.target_x_vars = []
         self.target_y_vars = []
         self.target_visible_vars = []
@@ -1129,71 +1216,76 @@ class Gui(tk.Tk):
         for i in range(4):
             row = ttk.Frame(targets_frame)
             row.pack(fill='x', pady=2)
-            ttk.Label(row, text=f"T{i+1}", width=3, anchor='w').pack(side='left', padx=(0,4))
+            ttk.Label(row, text=f"T{i + 1}", width=3, anchor='w').pack(side='left', padx=(0, 4))
             vx = tk.StringVar(value=f"{defaults_xy[i][0]:.3f}")
             vy = tk.StringVar(value=f"{defaults_xy[i][1]:.3f}")
             self.target_x_vars.append(vx)
             self.target_y_vars.append(vy)
-            ttk.Label(row, text="X:").pack(side='left', padx=(0,2))
-            ttk.Entry(row, textvariable=vx, width=7).pack(side='left', padx=(0,6))
-            ttk.Label(row, text="Y:").pack(side='left', padx=(0,2))
-            ttk.Entry(row, textvariable=vy, width=7).pack(side='left', padx=(0,6))
+            ttk.Label(row, text="X:").pack(side='left', padx=(0, 2))
+            ttk.Entry(row, textvariable=vx, width=7).pack(side='left', padx=(0, 6))
+            ttk.Label(row, text="Y:").pack(side='left', padx=(0, 2))
+            ttk.Entry(row, textvariable=vy, width=7).pack(side='left', padx=(0, 6))
             vis = tk.BooleanVar(value=(i < 2))
             self.target_visible_vars.append(vis)
             ttk.Checkbutton(row, text="Show", variable=vis).pack(side='left')
 
         status = ttk.LabelFrame(controls_col, text="Status", padding=8)
-        status.pack(fill='x', pady=(8,0))
+        status.pack(fill='x', pady=(8, 0))
         self.pos_var = tk.StringVar(value="X=0.0 Y=0.0 Z=0.0")
         self.spd_var = tk.StringVar(value="Speed=0.0 mm/s")
         self.joy_var = tk.StringVar(value="Mag=0.00 kg  Ang=0.0°")
-        self.collision_status_var = tk.StringVar(value=f"Collision: {'ACTIVE' if CONFIG['control']['collision_active'] else 'INACTIVE'}")
+        self.collision_status_var = tk.StringVar(
+            value=f"Collision: {'ACTIVE' if CONFIG['control']['collision_active'] else 'INACTIVE'}")
         self.joints_var = tk.StringVar(value="J1=0.0mm J2=0.0° J3=0.0° J4=0.0°")
         for var in (self.pos_var, self.spd_var, self.joy_var, self.collision_status_var, self.joints_var):
-            ttk.Label(status, textvariable=var, font=('Courier',10)).pack(anchor='w', pady=2)
+            ttk.Label(status, textvariable=var, font=('Courier', 10)).pack(anchor='w', pady=2)
 
         log_frame = ttk.LabelFrame(controls_col, text="Log", padding=8)
-        log_frame.pack(fill='x', pady=(8,0))
+        log_frame.pack(fill='x', pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=5, width=30, state='disabled')
         self.log_text.pack(fill='x')
 
         plots_frame = ttk.LabelFrame(left, text="Plots", padding=8)
-        plots_frame.grid(row=0, column=1, sticky="nw", padx=(0,0))
-        self.xy_canvas = tk.Canvas(plots_frame, width=self.xy_px, height=self.xy_px, bg="white", highlightthickness=1, highlightbackground="#999")
-        self.xy_canvas.grid(row=0, column=0, pady=(0,8))
+        plots_frame.grid(row=0, column=1, sticky="nw", padx=(0, 0))
+        self.xy_canvas = tk.Canvas(plots_frame, width=self.xy_px, height=self.xy_px, bg="white", highlightthickness=1,
+                                   highlightbackground="#999")
+        self.xy_canvas.grid(row=0, column=0, pady=(0, 8))
         self.xy_canvas.bind("<Button-1>", self._on_xy_click)
-        self.joy_canvas = tk.Canvas(plots_frame, width=self.joy_px, height=self.joy_px, bg="white", highlightthickness=1, highlightbackground="#999")
+        self.joy_canvas = tk.Canvas(plots_frame, width=self.joy_px, height=self.joy_px, bg="white",
+                                    highlightthickness=1, highlightbackground="#999")
         self.joy_canvas.grid(row=1, column=0, pady=(0, 8))
 
-        self.force_canvas = tk.Canvas(plots_frame, width=self.joy_px, height=self.joy_px, bg="white", highlightthickness=1, highlightbackground="#999")
+        self.force_canvas = tk.Canvas(plots_frame, width=self.joy_px, height=self.joy_px, bg="white",
+                                      highlightthickness=1, highlightbackground="#999")
         self.force_canvas.grid(row=2, column=0)
 
-        self.ee_dot = self.xy_canvas.create_oval(0,0,0,0, fill="#22a", outline="")
-        self.ee_target_dot = self.xy_canvas.create_oval(0,0,0,0, fill="#f00", outline="", tags="target")
-        r = self.joy_half-10
-        self.joy_canvas.create_oval(self.joy_half-r, self.joy_half-r, self.joy_half+r, self.joy_half+r, outline="#ddd")
-        self.joy_canvas.create_line(self.joy_half, 8, self.joy_half, self.joy_px-8, fill="#eee")
-        self.joy_canvas.create_line(8, self.joy_half, self.joy_px-8, self.joy_half, fill="#eee")
-        self.joy_arrow = self.joy_canvas.create_line(0,0,0,0, width=3, fill="#c33", arrow=tk.LAST)
-        
+        self.ee_dot = self.xy_canvas.create_oval(0, 0, 0, 0, fill="#22a", outline="")
+        self.ee_target_dot = self.xy_canvas.create_oval(0, 0, 0, 0, fill="#f00", outline="", tags="target")
+        r = self.joy_half - 10
+        self.joy_canvas.create_oval(self.joy_half - r, self.joy_half - r, self.joy_half + r, self.joy_half + r,
+                                    outline="#ddd")
+        self.joy_canvas.create_line(self.joy_half, 8, self.joy_half, self.joy_px - 8, fill="#eee")
+        self.joy_canvas.create_line(8, self.joy_half, self.joy_px - 8, self.joy_half, fill="#eee")
+        self.joy_arrow = self.joy_canvas.create_line(0, 0, 0, 0, width=3, fill="#c33", arrow=tk.LAST)
+
         # Setup force plot: draw axes and labels
         force_half = self.joy_px // 2
-        self.force_canvas.create_line(20, force_half, self.joy_px-20, force_half, fill="#ddd", width=1)  # X axis
-        self.force_canvas.create_line(20, 20, 20, self.joy_px-20, fill="#ddd", width=1)  # Y axis
-        self.force_canvas.create_text(self.joy_px-10, force_half+5, text="t", anchor='e', font=('Arial', 8))
+        self.force_canvas.create_line(20, force_half, self.joy_px - 20, force_half, fill="#ddd", width=1)  # X axis
+        self.force_canvas.create_line(20, 20, 20, self.joy_px - 20, fill="#ddd", width=1)  # Y axis
+        self.force_canvas.create_text(self.joy_px - 10, force_half + 5, text="t", anchor='e', font=('Arial', 8))
         self.force_canvas.create_text(15, 15, text="F (N)", anchor='nw', font=('Arial', 8))
 
     def _draw_cursor_marker(self):
         """Draw or update a crosshair showing the cursor world location on XY canvas."""
         x_m, y_m = self.cursor_xy_m
-        x_px = int(self.xy_half + (x_m*1000.0)*self.mm_to_px)
-        y_px = int(self.xy_half - (y_m*1000.0)*self.mm_to_px)
+        x_px = int(self.xy_half + (x_m * 1000.0) * self.mm_to_px)
+        y_px = int(self.xy_half - (y_m * 1000.0) * self.mm_to_px)
         if self.cursor_marker is not None:
             self.xy_canvas.delete(self.cursor_marker)
         # small crosshair
         size = 6
-        self.cursor_marker = self.xy_canvas.create_line(x_px-size, y_px, x_px+size, y_px, fill="#0a0", width=2)
-        self.xy_canvas.create_line(x_px, y_px-size, x_px, y_px+size, fill="#0a0", width=2, tags=("cursor_aux",))
+        self.cursor_marker = self.xy_canvas.create_line(x_px - size, y_px, x_px + size, y_px, fill="#0a0", width=2)
+        self.xy_canvas.create_line(x_px, y_px - size, x_px, y_px + size, fill="#0a0", width=2, tags=("cursor_aux",))
         # remove previous aux lines
         self.xy_canvas.delete("cursor_aux")
 
@@ -1221,8 +1313,9 @@ class Gui(tk.Tk):
     def _slider(self, parent, key, label, vmin, vmax, v0, step):
         var = tk.DoubleVar(value=v0)
         self.vars[key] = var
-        ttk.Label(parent, text=label).pack(anchor='w', pady=(4,0))
-        tk.Scale(parent, variable=var, from_=vmin, to=vmax, orient='horizontal', resolution=step, length=260).pack(fill='x')
+        ttk.Label(parent, text=label).pack(anchor='w', pady=(4, 0))
+        tk.Scale(parent, variable=var, from_=vmin, to=vmax, orient='horizontal', resolution=step, length=260).pack(
+            fill='x')
         value_label = ttk.Label(parent, text=f"{v0:.2f}")
         value_label.pack(anchor='w')
         self.value_labels[key] = value_label
@@ -1238,13 +1331,13 @@ class Gui(tk.Tk):
         with self.lock:
             for key, var in self.vars.items():
                 self.shared['tuning'][key] = var.get()
-            pos = self.shared.get('ee_pos_mm',[0.0,0.0,0.0])
+            pos = self.shared.get('ee_pos_mm', [0.0, 0.0, 0.0])
             spd = self.shared.get('ee_speed_mm_s', 0.0)
-            js  = self.shared.get('joystick_state', {})
+            js = self.shared.get('joystick_state', {})
 
             collision_active = self.shared.get('tuning', {}).get('collision_active', False)
             collision_detected = self.shared.get('collision_detected', False)
-            joints = self.shared.get('joint_angles_deg', {'j1_mm':0, 'j2_deg':0, 'j3_deg':0, 'j4_deg':0})
+            joints = self.shared.get('joint_angles_deg', {'j1_mm': 0, 'j2_deg': 0, 'j3_deg': 0, 'j4_deg': 0})
 
         targets_xy = []
         targets_visible = []
@@ -1262,18 +1355,20 @@ class Gui(tk.Tk):
             self.shared['targets_visible'] = targets_visible
         self.pos_var.set(f"X={pos[0]:.1f}  Y={pos[1]:.1f}  Z={pos[2]:.1f}")
         self.spd_var.set(f"Speed={spd:.1f} mm/s")
-        self.joy_var.set(f"Mag={js.get('mag_kg',0.0):.2f} kg  Ang={js.get('ang_deg_360',0.0):.1f}°")
-        self.collision_status_var.set(f"Collision: {'DETECTED!' if collision_detected else 'CLEAR'} ({'ACTIVE' if collision_active else 'INACTIVE'})")
-        self.joints_var.set(f"J1={joints['j1_mm']:.1f}mm J2={joints['j2_deg']:.1f}° J3={joints['j3_deg']:.1f}° J4={joints['j4_deg']:.1f}°")
-        x_px = int(self.xy_half + (pos[0]*self.mm_to_px))
-        y_px = int(self.xy_half - (pos[1]*self.mm_to_px))
-        self.xy_canvas.coords(self.ee_dot, x_px-5, y_px-5, x_px+5, y_px+5)
+        self.joy_var.set(f"Mag={js.get('mag_kg', 0.0):.2f} kg  Ang={js.get('ang_deg_360', 0.0):.1f}°")
+        self.collision_status_var.set(
+            f"Collision: {'DETECTED!' if collision_detected else 'CLEAR'} ({'ACTIVE' if collision_active else 'INACTIVE'})")
+        self.joints_var.set(
+            f"J1={joints['j1_mm']:.1f}mm J2={joints['j2_deg']:.1f}° J3={joints['j3_deg']:.1f}° J4={joints['j4_deg']:.1f}°")
+        x_px = int(self.xy_half + (pos[0] * self.mm_to_px))
+        y_px = int(self.xy_half - (pos[1] * self.mm_to_px))
+        self.xy_canvas.coords(self.ee_dot, x_px - 5, y_px - 5, x_px + 5, y_px + 5)
         self.ee_trail.append((x_px, y_px))
         self.xy_canvas.delete("trail")
         for i, (px, py) in enumerate(self.ee_trail):
             alpha = (i / len(self.ee_trail)) ** 2
-            color = f"#{int(0x22 + alpha*0xdd):02x}{int(0xaa + alpha*0x55):02x}{int(0xaa):02x}"
-            self.xy_canvas.create_oval(px-2, py-2, px+2, py+2, fill="", outline=color, width=1, tags="trail")
+            color = f"#{int(0x22 + alpha * 0xdd):02x}{int(0xaa + alpha * 0x55):02x}{int(0xaa):02x}"
+            self.xy_canvas.create_oval(px - 2, py - 2, px + 2, py + 2, fill="", outline=color, width=1, tags="trail")
 
         with self.lock:
             tgt = self.shared.get('target_xy_m', None)
@@ -1292,34 +1387,35 @@ class Gui(tk.Tk):
             x_m, y_m = targets_xy[i]
             tx_px = int(self.xy_half + (x_m * 1000.0) * self.mm_to_px)
             ty_px = int(self.xy_half - (y_m * 1000.0) * self.mm_to_px)
-            self.xy_canvas.create_oval(tx_px - 4, ty_px - 4, tx_px + 4, ty_px + 4, fill="#f80", outline="#c60", width=1, tags="target_dots")
+            self.xy_canvas.create_oval(tx_px - 4, ty_px - 4, tx_px + 4, ty_px + 4, fill="#f80", outline="#c60", width=1,
+                                       tags="target_dots")
 
-        ang = js.get('ang_deg_360',0.0)
-        mag = js.get('mag_kg',0.0)
-        mag01 = max(0.0, min(1.0, mag/CONFIG['smooth']['max_mag_kg']))
-        R = (self.joy_half-16) * mag01
+        ang = js.get('ang_deg_360', 0.0)
+        mag = js.get('mag_kg', 0.0)
+        mag01 = max(0.0, min(1.0, mag / CONFIG['smooth']['max_mag_kg']))
+        R = (self.joy_half - 16) * mag01
         rad = math.radians(ang)
-        x0,y0 = self.joy_half, self.joy_half
-        x1 = x0 + R*math.sin(rad)
-        y1 = y0 - R*math.cos(rad)
+        x0, y0 = self.joy_half, self.joy_half
+        x1 = x0 + R * math.sin(rad)
+        y1 = y0 - R * math.cos(rad)
         color = f"#{int(0xff * (1 - mag01)):02x}{int(0xff * mag01):02x}00"
-        self.joy_canvas.coords(self.joy_arrow, x0,y0, x1,y1)
+        self.joy_canvas.coords(self.joy_arrow, x0, y0, x1, y1)
         self.joy_canvas.itemconfig(self.joy_arrow, fill=color)
-        
+
         # Update force plot
         with self.lock:
             Fx, Fy = self.shared.get("force_xy_N", (0.0, 0.0))
         self.force_history.append((Fx, Fy))
-        
+
         # Clear previous force plot lines
         self.force_canvas.delete("force_line")
-        
+
         if len(self.force_history) > 1:
             force_half = self.joy_px // 2
             plot_width = self.joy_px - 40  # Leave margins
             plot_height = self.joy_px - 40
             force_max = 30.0  # Max force in N for scaling
-            
+
             # Draw Fx line (red)
             points_fx = []
             points_fy = []
@@ -1331,28 +1427,29 @@ class Gui(tk.Tk):
                 y_fy = max(20, min(self.joy_px - 20, y_fy))
                 points_fx.append((x_px, y_fx))
                 points_fy.append((x_px, y_fy))
-            
+
             # Draw Fx line
             if len(points_fx) > 1:
                 for i in range(len(points_fx) - 1):
                     self.force_canvas.create_line(
                         points_fx[i][0], points_fx[i][1],
-                        points_fx[i+1][0], points_fx[i+1][1],
+                        points_fx[i + 1][0], points_fx[i + 1][1],
                         fill="#c33", width=2, tags="force_line"
                     )
-            
+
             # Draw Fy line (blue)
             if len(points_fy) > 1:
                 for i in range(len(points_fy) - 1):
                     self.force_canvas.create_line(
                         points_fy[i][0], points_fy[i][1],
-                        points_fy[i+1][0], points_fy[i+1][1],
+                        points_fy[i + 1][0], points_fy[i + 1][1],
                         fill="#33c", width=2, tags="force_line"
                     )
-            
+
             # Draw zero line
-            self.force_canvas.create_line(20, force_half, self.joy_px-20, force_half, fill="#aaa", width=1, tags="force_line")
-        
+            self.force_canvas.create_line(20, force_half, self.joy_px - 20, force_half, fill="#aaa", width=1,
+                                          tags="force_line")
+
         self.after(self.refresh_ms, self._tick)
 
     # def _on_close(self):
@@ -1402,7 +1499,7 @@ if __name__ == "__main__":
     try:
         # shared['joystick'] = JoystickReader(CONFIG['joystick'], CONFIG['smooth'], shared, lock)
 
-        # --- FORCE SENSOR (TEMP joystick substitute) ---
+        # --- FORCE SENSOR ---
         shared['force_sensor'] = ForceSensorReader(port="COM3", baud=921600, scale_N=300.0)
 
         app = Gui(cmd_q, shared, lock)

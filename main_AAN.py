@@ -38,6 +38,22 @@
 # K is time-varying: K_d(t) = K_min + (K_max - K_min) · η_f(t)
 # B is only time-varying if you set Bx_max ≠ Bx_min or By_max ≠ By_min; with the current defaults, B is fixed at 40
 
+# What changes the assistance level K_d(t):
+# Distance from target – Yes.
+# Through w_e: far → high w_e → η can be high → higher K_d(t).
+# Near → low w_e → lower K_d(t).
+# Magnitude of force – Yes.
+# Through w_F: high force → high w_F → η can be high → higher K_d(t).
+# Low force → low w_F → lower K_d(t).
+# Direction of force – No (in the current formulation).
+# w_F uses only ‖F_ext‖, not direction. So K_d(t) is the same whether you push toward or away from the target.
+# Direction only changes the effect of that stiffness:
+# Force toward target → spring and force same way → feels like assistance.
+# Force away from target → spring and force opposite → feels like resistance (same K_d(t), different net motion).
+# Summary
+# Distance and force magnitude directly affect the assistance level (how strong the spring is).
+# Direction does not change the assistance level; it only determines whether that spring force helps you (toward target) or resists you (away from target).
+
 ####### --------------------------------------------------------
 
 import pybullet as p

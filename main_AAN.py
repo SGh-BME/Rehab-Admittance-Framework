@@ -34,6 +34,10 @@
 # Always guides toward target when assistance is active
 # Stable (K_d(t) remains positive semi-definite)
 # Use case: Suitable for rehabilitation where guidance toward the target is desired, even if the user pushes away. Less suitable if free exploration in any direction is needed.
+
+# K is time-varying: K_d(t) = K_min + (K_max - K_min) · η_f(t)
+# B is only time-varying if you set Bx_max ≠ Bx_min or By_max ≠ By_min; with the current defaults, B is fixed at 40
+
 ####### --------------------------------------------------------
 
 import pybullet as p
